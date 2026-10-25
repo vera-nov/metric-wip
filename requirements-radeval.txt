@@ -1,0 +1,4 @@
+-r requirements-fit.txt
+numpy>=1.26,<2
+transformers>=4.40,<5
+radeval==0.2.0

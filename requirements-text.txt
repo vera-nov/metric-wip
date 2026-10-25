@@ -1,0 +1,8 @@
+# All seven English reference-based scores; candidate stack, GPU smoke-test required.
+-r requirements-fit.txt
+numpy>=1.26,<2
+transformers==4.46.3
+radgraph==0.1.18
+radeval==0.2.0
+accelerate>=1,<2
+sentencepiece>=0.2,<0.3
