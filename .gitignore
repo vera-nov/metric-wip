@@ -10,3 +10,4 @@ quality_weights.json
 locks/
 *.png
 tmp/
+*.json
