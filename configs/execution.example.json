@@ -1,5 +1,4 @@
 {
   "device": "cuda",
-  "gpu": 2,
-  "image_root": "/home/v.novikova/metric-wip"
+  "image_root": "/data/cxr"
 }

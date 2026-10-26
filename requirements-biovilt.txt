@@ -1,3 +1,6 @@
 -r requirements-fit.txt
 transformers==4.30.2
 hi-ml-multimodal==0.2.2
+numpy>=1.26,<2
+torch==2.6.0
+torchvision==0.21.0

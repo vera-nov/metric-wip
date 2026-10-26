@@ -24,7 +24,11 @@ MODEL_DEFAULTS = {
 RUNTIME_DEFAULTS = {
     "translation_max_new_tokens": 1024, "green_max_new_tokens": 2048,
     "green_batch_size": 1, "text_batch_size": 16, "image_batch_size": 16,
-    "device": "cuda", "gpu": None,
+    "device": "cuda",
+}
+ENVIRONMENT_DEFAULTS = {
+    "translate": "cxr-qwen", "green": "cxr-qwen",
+    "text": "cxr-text", "image": "cxr-image",
 }
 METHODS = ["radgraph_partial", "radcliq", "ratescore", "cosinesim_cxrbert",
            "bertscore_cxrbert", "cosinesim_biovilt", "bertscore_biovilt"]
@@ -76,6 +80,7 @@ def resolved_plan(plan):
     p = dict(plan)
     p["models"] = {**MODEL_DEFAULTS, **p.get("models", {})}
     p["runtime"] = {**RUNTIME_DEFAULTS, **p.get("runtime", {})}
+    p["environments"] = p.get("environments", dict(ENVIRONMENT_DEFAULTS))
     p["translators"] = p.get("translators", ["qwen", "hy_mt", "translategemma"])
     p["translation_kinds"] = p.get("translation_kinds", ["terms", "noterms"])
     p["methods"] = p.get("methods", METHODS)
@@ -299,7 +304,7 @@ def worker(request_path):
     os.close(fd)
     try:
         kwargs = {"input_csv": str(work_dir/"base.csv"), "output_csv": tmp,
-                  "device": r["device"], "gpu": r["gpu"]}
+                  "device": r["device"], "gpu": r.get("gpu")}
         if job["stage"] in {"text", "image"}:
             translated = read_csv(work_dir/(job["deps"][0]+".csv"))
             merged = merge_exact(base, translated)
@@ -383,6 +388,9 @@ def fit(plan, work_dir, output):
                 "provenance": {"code_sha256": code_hash(), "input": read_json(Path(work_dir)/"input_manifest.json"),
                                "stages": provenance}, "target_direction": "lower"}
     atomic_json(output, artifact)
+    from file_scores import export_artifact
+    export_artifact(artifact, Path(output).with_name("quality_weights.json"),
+                    Path(output).with_name("quality_components.json"))
     print(json.dumps({"artifact": str(output), "selected_features": final["selected_features"],
                       "weights": final["weights"], "calibration": final["calibration"],
                       "cv": final["training"]}, ensure_ascii=False, indent=2))

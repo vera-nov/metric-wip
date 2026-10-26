@@ -9,7 +9,7 @@ def main():
     p.add_argument('--path-to-data-description-for-evaluation', '--input', dest='input', required=True)
     p.add_argument('--output', default='quality_scores.json')
     p.add_argument('--work-dir', required=True)
-    p.add_argument('--execution-config', help='Optional JSON to relocate environments, GPU and image_root')
+    p.add_argument('--execution-config', help='Optional JSON to relocate environments and image_root')
     p.add_argument('--resume', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     args = p.parse_args()

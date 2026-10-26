@@ -1,106 +1,90 @@
-# Оценка русскоязычных рентгенологических отчетов
+# Оценка рентгенологических отчётов
 
-## Порядок запуска полного пайплайна
+Три независимые компоненты: русский GREEN, текстовая метрика после перевода RU→EN, BioViL-T image/text. Отдельный CPU-скрипт применяет обученные scaling → fusion → calibration и сохраняет итог.
 
-Пайплайн состоит из трёх основных этапов: вычисление признаков → подбор оптимальной конфигурации → оценка новых данных.
+## Установка окружений
 
-### 1. Подготовка окружения и данных
+Нужны Linux, conda, доступ к Hugging Face и подходящий NVIDIA-драйвер.
 
-```
+```bash
 git clone https://github.com/vera-nov/metric-wip.git
 cd metric-wip
-
-conda create -n cxr-fit python=3.11 pip -y
-conda run -n cxr-fit python -m pip install -r requirements-fit.txt
+bash scripts/setup_envs.sh
+export CUDA_VISIBLE_DEVICES=0
 ```
 
-Для нейросетевых этапов дополнительно нужны окружения `cxr-qwen`, `cxr-translate`, `cxr-text`, `cxr-image`. Инструкции по их установке, включая PyTorch и CUDA, находятся в [SERVER_RUNBOOK_RU.md](https://github.com/vera-nov/metric-wip/blob/main/SERVER_RUNBOOK_RU.md).
+| Окружение | Python | Назначение |
+|---|---|---|
+| `cxr-qwen` | 3.11 | GREEN, Qwen, HY-MT, TranslateGemma — последовательно |
+| `cxr-text` | 3.12 | Все семь английских текстовых метрик; spaCy 3.8.2 |
+| `cxr-image` | 3.11 | BioViL-T image/text |
+| `cxr-fit` | 3.11 | Контроллер, подбор параметров и CPU-слияние |
 
-Создать рабочую конфигурацию:
+Скрипт установки проверяет `pip check` и останавливается при ошибке. По умолчанию используются PyTorch 2.6.0 / torchvision 0.21.0 CUDA 12.4. Для другой совместимой сборки задайте `TORCH_INDEX_URL` перед установкой. GPU выбирается только через `CUDA_VISIBLE_DEVICES`; номер GPU в JSON не нужен. Установку выполняют один раз в новые окружения.
 
-```
-cp configs/train.server40gb.example.json configs/train.local.json
-```
+Для TranslateGemma заранее примите условия `google/translategemma-12b-it` и авторизуйтесь:
 
-В `configs/train.local.json` указать:
-
-- `input_csv` — путь к обучающей таблице;
-- `image_root` — корневую директорию рентгеновских снимков;
-- `runtime.gpu` — номер используемой GPU;
-- `columns` — соответствие названий столбцов.
-
-В обучающем CSV необходимы кандидат (`candidate`), эталон (`reference`), путь к снимку (`image`) и число клинически значимых ошибок (`target`).
-
-Важно: снимков в репозитории нет. Также нужен доступ Hugging Face к модели TranslateGemma.
-
-### 2. Вычисление признаков
-
-Сначала проверить план запуска:
-
-```
-conda run -n cxr-fit python build_method.py \
-  --plan configs/train.local.json \
-  --work-dir work/train \
-  --dry-run
+```bash
+conda run --no-capture-output -n cxr-qwen python -c 'from huggingface_hub import login; login()'
 ```
 
-Затем запустить вычисления:
+## Проверка каждой модели
 
-```
-conda run -n cxr-fit python build_method.py \
-  --plan configs/train.local.json \
-  --work-dir work/train \
-  --features-only --resume
-```
+Перед большим расчётом выполните один короткий пример с настоящим рентгеновским снимком:
 
-На этом этапе последовательно вычисляются:
-
-1. Переводы RU→EN с использованием Qwen, HY-MT и TranslateGemma.
-2. Русская метрика GREEN.
-3. Английские текстовые метрики (RadGraph, RadCliQ, RaTEScore, BERTScore, cosine similarity).
-4. Визуальная метрика на основе BioViL-T.
-
-Результат: `work/train/features.csv` и отдельные CSV для каждого компонента.
-
-Флаг `--resume` позволяет продолжить расчёт после сбоя без повторного вычисления успешно завершённых этапов.
-
-### 3. Подбор оптимальной конфигурации
-
-После вычисления всех признаков выполнить:
-
-```
-conda run -n cxr-fit python build_method.py \
-  --plan configs/train.local.json \
-  --work-dir work/train \
-  --fit-only \
-  --output-json quality_method_config.json
+```bash
+conda run --no-capture-output -n cxr-fit python smoke_test.py --image /data/cxr/example.png
 ```
 
-На этом этапе используется nested cross-validation (5×5) для выбора:
+Проверяются три переводчика, GREEN, RadGraph, RadCliQ, RaTEScore, CXR-BERT, BioViL-T text и image/text. Модели запускаются последовательно; отчёт — `work/smoke/smoke_result.json`. Ошибка любого этапа завершает команду с ненулевым кодом. `--resume` продолжает успешные этапы; `--dry-run` показывает команды без загрузки моделей.
 
-- оптимальной комбинации текстовых и визуальных метрик;
-- весов трёх компонентов;
-- параметров нормализации и логистической калибровки.
+## Оценка
 
-Результат: `quality_method_config.json` — итоговая конфигурация метрики, необходимая для дальнейшей оценки. На этом этапе GPU не требуется.
+`reports.json` — JSON-список должен иметь вид:
 
-Примечание: если RadCliQ выдаёт нулевые или отрицательные значения, режим `lower_transform: "reciprocal"` вызовет ошибку. Можно явно выбрать `"negate"`, но это изменение методики преобразования признака.
-
-### 4. Оценка на новых данных
-
-Подготовить `new_reports.csv` с теми же названиями столбцов для кандидата, эталона и изображения, что и при обучении. Экспертная разметка ошибок (`target`) уже не требуется.
-
-Запустить:
-
-```
-conda run -n cxr-fit python evaluate.py \
-  --config quality_method_config.json \
-  --input new_reports.csv \
-  --work-dir work/inference \
-  --output quality_scores.json \
-  --resume
+```json
+[
+  {
+    "report_id": "0001",
+    "reference_text": "Лёгкие без очаговых изменений. Выпота нет.",
+    "candidate_text": "Очаговых изменений и выпота не выявлено.",
+    "reference_image_path": "/data/cxr/example.png"
+  }
+]
 ```
 
-Результат: `quality_scores.json`, содержащий итоговую оценку `quality_score` в диапазоне [0, 1] для каждого отчёта, оценки выбранных компонентов и объяснения GREEN.
+Относительные пути к снимкам считаются от папки входного JSON. Порядок записей и дополнительные поля сохраняются. Есть образец [examples/reports.json](examples/reports.json).
 
-При оценке используются только компоненты и параметры, выбранные на этапе обучения. Повторный подбор конфигурации не выполняется.
+Из корня репозитория запустите:
+```bash
+bash scripts/evaluate_all.sh
+````
+или
+```bash
+conda run --no-capture-output -n cxr-fit python score_component.py russian reports.json
+conda run --no-capture-output -n cxr-fit python score_component.py text reports.json
+conda run --no-capture-output -n cxr-fit python score_component.py image reports.json
+conda run -n cxr-fit python merge_scores.py
+```
+
+Получатся `russian_score.json`, `image_score.json`, `text_score.json` и `final_score.json`: каждый — тот же список с единственным добавленным полем `score`. 
+
+Пути при необходимости меняются через `--config`, `--output`, `--work-dir`; у слияния — `--weights` и `--output`. Например:
+
+```bash
+conda run -n cxr-fit python merge_scores.py runs/russian.json runs/text.json runs/image.json --output runs/final_scores.json
+```
+
+По умолчанию готовые этапы переиспользуются после проверки кэша. `--no-resume` повторно запускает worker-процессы; валидные ответы GREEN из его журнала могут переиспользоваться. Для полностью нового расчёта укажите новый `--work-dir`. Команды с общей рабочей папкой запускайте последовательно.
+
+## Обучение и прежний интерфейс
+
+Краткая инструкция: [docs/training.md](docs/training.md). Прежние аргументы `build_method.py` и `evaluate.py` сохранены.
+
+Локальные тесты без скачивания моделей:
+
+```bash
+conda run -n cxr-fit python -m unittest discover -s tests -v
+```
+
+Совместимость текстовых зависимостей и границы проверки описаны в [docs/dependencies.md](docs/dependencies.md).

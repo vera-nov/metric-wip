@@ -14,7 +14,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pipeline as p
 from calculate_russian_text import GreenGenerationLimitError, ManualGREENQwen
-from tools.revalidate_green_hotfix_cache import migrate
+from scripts.migrations.revalidate_green_hotfix_cache import migrate
 
 
 def answer(insignificant="Нет клинически незначимых ошибок."):

@@ -1,6 +1,0 @@
--r requirements-fit.txt
-transformers>=4.57,<4.58
-accelerate>=1,<2
-sentencepiece>=0.2,<0.3
-pillow>=10,<12
-torch>=2.4

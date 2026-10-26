@@ -1,6 +1,8 @@
 -r requirements-fit.txt
+# Qwen GREEN and all three translators share the generation environment.
 transformers>=5.2,<6
 accelerate>=1,<2
 sentencepiece>=0.2,<0.3
 pillow>=10,<12
-torch>=2.6
+torch==2.6.0
+torchvision==0.21.0

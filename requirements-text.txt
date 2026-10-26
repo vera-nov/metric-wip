@@ -1,8 +1,14 @@
-# All seven English reference-based scores; candidate stack, GPU smoke-test required.
+# Python 3.12: medspacy 1.3.1 allows spaCy 3.8 only on Python >=3.12.
 -r requirements-fit.txt
-numpy>=1.26,<2
+numpy==1.26.4
 transformers==4.46.3
 radgraph==0.1.18
 radeval==0.2.0
+medspacy==1.3.1
+spacy==3.8.2
+# 8.3.0-8.3.2 require NumPy 2, conflicting with RadEval's numpy<2.
+thinc==8.3.3
 accelerate>=1,<2
 sentencepiece>=0.2,<0.3
+torch==2.6.0
+torchvision==0.21.0

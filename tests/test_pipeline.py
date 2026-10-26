@@ -187,6 +187,10 @@ class PipelineTests(unittest.TestCase):
                 # Fitting works entirely from cached scores, even without source images.
                 (root/'image.png').unlink()
                 artifact = p.fit(plan,wd,root/'metric.json')
+                self.assertEqual(set(p.read_json(root/'quality_weights.json')),
+                                 {'scaling', 'fusion', 'calibration'})
+                self.assertEqual(set(p.read_json(root/'quality_components.json')['components']),
+                                 {'russian', 'text', 'image'})
                 self.assertEqual(len(calls),4)
                 (root/'image.png').write_bytes(b'fixture image bytes; neural workers are mocked')
                 test_csv = root/'new.csv'; source.drop(columns='errors').head(3).to_csv(test_csv,index=False)

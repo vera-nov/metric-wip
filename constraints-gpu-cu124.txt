@@ -1,4 +1,0 @@
-# Pair from the official PyTorch 2.6.0 CUDA 12.4 installation instructions.
-# Install CUDA wheels explicitly before using this constraints file.
-torch==2.6.0
-torchvision==0.21.0

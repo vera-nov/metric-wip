@@ -4,5 +4,9 @@ __pycache__/
 work/
 quality_method_config.json
 quality_scores.json
+quality_components.json
+quality_weights.json
+[ABCD].json
+locks/
 *.png
 tmp/
