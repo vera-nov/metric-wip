@@ -1,6 +1,6 @@
 {
   "input_csv": "../russian_RadEvalX.csv",
-  "image_root": "..",
+  "image_root": "/home/v.novikova/metric-wip",
   "columns": {
     "row_id": "report_id",
     "candidate": "M2Tr-Generation_ru",
@@ -44,7 +44,7 @@
   },
   "runtime": {
     "device": "cuda",
-    "gpu": 0,
+    "gpu": 2,
     "translation_max_new_tokens": 1024,
     "green_max_new_tokens": 2048,
     "green_batch_size": 1,

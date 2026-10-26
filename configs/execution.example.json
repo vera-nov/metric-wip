@@ -1,5 +1,5 @@
 {
   "device": "cuda",
-  "gpu": 0,
-  "image_root": "/absolute/path/to/test/images"
+  "gpu": 2,
+  "image_root": "/home/v.novikova/metric-wip"
 }

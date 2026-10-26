@@ -193,37 +193,95 @@ class ManualGREENQwen:
         return count, desc
 
     def parse(self, text: str) -> ParsedGreen:
-        sig_section = self._extract_section(text, "Клинически значимые ошибки")
-        insig_section = self._extract_section(text, "Клинически незначимые ошибки")
-        matched_section = self._extract_section(text, "Совпадающие находки")
+        text = re.sub(r"\*\*|__|`", "", text)
+        text = text.replace("：", ":").replace("\u00a0", " ")
+
+        sig_section = self._extract_section(
+            text, "Клинически значимые ошибки"
+        )
+        insig_section = self._extract_section(
+            text, "Клинически незначимые ошибки"
+        )
+        matched_section = self._extract_section(
+            text, "Совпадающие находки"
+        )
+
         if not sig_section or not insig_section or not matched_section:
-            raise ValueError("Incomplete GREEN answer: missing required sections")
-        errors: Dict[str, Any] = {"significant": {}, "insignificant": {}}
-        sig_total = 0
-        insig_total = 0
-        for label, section in (("significant", sig_section), ("insignificant", insig_section)):
-            for line in section.splitlines():
-                if not line.strip().startswith("("):
-                    continue
-                count, desc = self._parse_count_and_desc(line)
-                errors[label][line.strip()[:3]] = {"count": count, "description": desc}
-                if label == "significant":
-                    sig_total += count
-                else:
-                    insig_total += count
-        for label, section in (("significant", sig_section), ("insignificant", insig_section)):
-            explicit_zero = re.search(r"ошибок нет", section, re.IGNORECASE)
-            if not explicit_zero and (len(errors[label]) != 6 or len(re.findall(r":\s*\d+", section)) != 6):
-                raise ValueError(f"GREEN error counts missing or malformed: {label}")
-        match = re.search(r"(\d+)", matched_section)
-        if not match:
+            raise ValueError("Incomplete GREEN answer: missing sections")
+
+        errors = {"significant": {}, "insignificant": {}}
+        alphabet = {
+            **{c: c for c in "абвгде"},
+            **dict(zip("abcdef", "абвгде")),
+        }
+        marker = r"^\s*(?:[-*•]\s*)?\(([абвгдеabcdef])\)\s*"
+        expected = {"(" + c + ")" for c in "абвгде"}
+
+        for label, section in (
+            ("significant", sig_section),
+            ("insignificant", insig_section),
+        ):
+            matches = list(
+                re.finditer(marker, section, re.MULTILINE | re.IGNORECASE)
+            )
+
+            for i, match in enumerate(matches):
+                key = "(" + alphabet[match.group(1).lower()] + ")"
+                end = (
+                    matches[i + 1].start()
+                    if i + 1 < len(matches)
+                    else len(section)
+                )
+                block = section[match.end():end]
+
+                count_match = re.match(
+                    r"[^:]*:\s*(\d+)\b(?![.,]\d)", block
+                )
+                if count_match is None or key in errors[label]:
+                    raise ValueError(
+                        f"Missing count or duplicate category: {label} {key}"
+                    )
+
+                errors[label][key] = {
+                    "count": int(count_match.group(1)),
+                    "description": block[count_match.end():].strip(
+                        " .;\t\n"
+                    ),
+                }
+
+            explicit_zero = re.fullmatch(
+                r"\s*(?:Клинически\s+(?:незначимых|значимых)\s+)?"
+                r"ошибок\s+нет[.!]?\s*",
+                section,
+                re.IGNORECASE,
+            )
+
+            if not explicit_zero and set(errors[label]) != expected:
+                raise ValueError(
+                    f"GREEN error counts missing or malformed: {label}"
+                )
+
+        sig_total = sum(
+            item["count"] for item in errors["significant"].values()
+        )
+        insig_total = sum(
+            item["count"] for item in errors["insignificant"].values()
+        )
+
+        match = re.match(r"\s*(\d+)\b", matched_section)
+        if match is None:
             raise ValueError("GREEN matched-findings count is missing")
+
         matched = int(match.group(1))
-        if not matched:
-            score = 0
-        else:
-            score = matched / (matched + sig_total)
-        return ParsedGreen(score=score, sig_total=sig_total, insig_total=insig_total, matched_findings=matched, errors=errors)
+        score = matched / (matched + sig_total) if matched else 0.0
+
+        return ParsedGreen(
+            score=score,
+            sig_total=sig_total,
+            insig_total=insig_total,
+            matched_findings=matched,
+            errors=errors,
+        )
 
     def score_pairs(
         self,
