@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
 import pandas as pd
 
 from model_loading import generation_model_class, require_complete_generation
@@ -136,12 +137,10 @@ class ManualGREENQwen:
 
 <число>. <находка 1>; <находка 2>; ...
 
-Если во всем разделе клинически значимых ошибок нет ошибок, напиши:
-
-Клинически значимых ошибок нет.
-Если во всем разделе клинически незначимых ошибок нет ошибок, напиши:
-
-Клинически незначимых ошибок нет."""
+В каждом из двух разделов ошибок обязательно перечисли все шесть категорий (а)–(е).
+Для отсутствующих ошибок укажи число 0 после двоеточия. Не заменяй категории
+общей фразой об отсутствии ошибок. В разделе совпадающих находок сначала
+укажи целое неотрицательное число. Сохрани все заголовки в квадратных скобках."""
 
     def clean_response(self, text: str) -> str:
         return strip_thinking(text).strip()
@@ -181,8 +180,10 @@ class ManualGREENQwen:
 
     def _extract_section(self, text: str, title: str) -> str:
         pattern = rf"\[{re.escape(title)}\]\s*:\s*(.*?)(?=\n\s*\[[^\]]+\]\s*:|\Z)"
-        match = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
-        return match.group(1).strip() if match else ""
+        matches = list(re.finditer(pattern, text, flags=re.DOTALL | re.IGNORECASE))
+        if len(matches) > 1:
+            raise ValueError(f"Duplicate GREEN section: {title}")
+        return matches[0].group(1).strip() if matches else ""
 
     def _parse_count_and_desc(self, line: str) -> tuple[int, str]:
         match = re.search(r":\s*(\d+)", line)
@@ -193,8 +194,16 @@ class ManualGREENQwen:
         return count, desc
 
     def parse(self, text: str) -> ParsedGreen:
+        text = strip_thinking(text)
         text = re.sub(r"\*\*|__|`", "", text)
         text = text.replace("：", ":").replace("\u00a0", " ")
+        # Accept Markdown and a colon inside brackets without changing counts.
+        for title in ("Объяснение", "Клинически значимые ошибки",
+                      "Клинически незначимые ошибки", "Совпадающие находки"):
+            text = re.sub(
+                rf"^\s*(?:\#{{1,6}}\s*)?(?:\[{title}\s*:?\s*\]|{title})\s*:?\s*$",
+                f"[{title}]:", text, flags=re.MULTILINE | re.IGNORECASE,
+            )
 
         sig_section = self._extract_section(
             text, "Клинически значимые ошибки"
@@ -214,19 +223,31 @@ class ManualGREENQwen:
             **{c: c for c in "абвгде"},
             **dict(zip("abcdef", "абвгде")),
         }
-        marker = r"^\s*(?:[-*•]\s*)?\(([абвгдеabcdef])\)\s*"
+        marker = r"^\s*(?:[-*•]\s*)?(?:\(([абвгдеabcdef])\)|([абвгдеabcdef])[.)])\s*"
         expected = {"(" + c + ")" for c in "абвгде"}
 
         for label, section in (
             ("significant", sig_section),
             ("insignificant", insig_section),
         ):
+            adjective = "значимых" if label == "significant" else "незначимых"
+            zero_patterns = (
+                rf"(?:Клинически\s+)?{adjective}\s+ошибок\s+нет",
+                rf"Нет\s+(?:клинически\s+)?{adjective}\s+ошибок",
+                rf"(?:Клинически\s+)?{adjective}\s+ошибок\s+не\s+(?:выявлено|обнаружено)",
+                rf"(?:Клинически\s+)?{adjective[:-1]}е\s+ошибки\s+отсутствуют",
+                r"Ошибок\s+нет|Нет\s+ошибок|Ошибки\s+отсутствуют|Не\s+(?:выявлено|обнаружено)|Нет|Отсутствуют|0",
+            )
+            if re.fullmatch(r"\s*(?:" + "|".join(zero_patterns) + r")[.!]?\s*",
+                            section, re.IGNORECASE):
+                errors[label] = {key: {"count": 0, "description": ""} for key in expected}
+                continue
             matches = list(
                 re.finditer(marker, section, re.MULTILINE | re.IGNORECASE)
             )
 
             for i, match in enumerate(matches):
-                key = "(" + alphabet[match.group(1).lower()] + ")"
+                key = "(" + alphabet[(match.group(1) or match.group(2)).lower()] + ")"
                 end = (
                     matches[i + 1].start()
                     if i + 1 < len(matches)
@@ -234,29 +255,26 @@ class ManualGREENQwen:
                 )
                 block = section[match.end():end]
 
-                count_match = re.match(
-                    r"[^:]*:\s*(\d+)\b(?![.,]\d)", block
+                # Counts must occur immediately after the marker or category's colon.
+                # Never search explanations for arbitrary digits or invent a zero.
+                count_match = re.match(r"(?:[^:\n]*:\s*)?(\d+)\b(?![.,]\d)", block)
+                zero_match = re.fullmatch(
+                    r"(?:[^:\n]*:\s*)?(?:нет(?:\s+ошибок)?|ошибок\s+нет|отсутствуют|"
+                    r"не\s+(?:выявлено|обнаружено))[.!]?\s*", block, re.IGNORECASE,
                 )
-                if count_match is None or key in errors[label]:
+                if (count_match is None and zero_match is None) or key in errors[label]:
                     raise ValueError(
                         f"Missing count or duplicate category: {label} {key}"
                     )
 
                 errors[label][key] = {
-                    "count": int(count_match.group(1)),
+                    "count": int(count_match.group(1)) if count_match else 0,
                     "description": block[count_match.end():].strip(
                         " .;\t\n"
-                    ),
+                    ) if count_match else "",
                 }
 
-            explicit_zero = re.fullmatch(
-                r"\s*(?:Клинически\s+(?:незначимых|значимых)\s+)?"
-                r"ошибок\s+нет[.!]?\s*",
-                section,
-                re.IGNORECASE,
-            )
-
-            if not explicit_zero and set(errors[label]) != expected:
+            if set(errors[label]) != expected:
                 raise ValueError(
                     f"GREEN error counts missing or malformed: {label}"
                 )
@@ -268,7 +286,7 @@ class ManualGREENQwen:
             item["count"] for item in errors["insignificant"].values()
         )
 
-        match = re.match(r"\s*(\d+)\b", matched_section)
+        match = re.match(r"\s*(\d+)\b(?![.,]\d)", matched_section)
         if match is None:
             raise ValueError("GREEN matched-findings count is missing")
 
@@ -289,29 +307,94 @@ class ManualGREENQwen:
         candidates: Sequence[str],
         batch_size: int = 1,
         max_new_tokens: int = 512,
+        row_ids: Optional[Sequence[str]] = None,
+        response_log: Optional[Path] = None,
+        cache_context: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
-        rows: List[Dict[str, Any]] = []
+        if len(references) != len(candidates) or batch_size < 1:
+            raise ValueError("GREEN needs equal pair counts and batch_size >= 1")
+        ids = list(row_ids) if row_ids is not None else [str(i) for i in range(len(references))]
+        if len(ids) != len(references) or len(set(ids)) != len(ids):
+            raise ValueError("GREEN row IDs must be unique and match pair counts")
         prompts = [self.make_prompt(str(r), str(c)) for r, c in zip(references, candidates)]
-        for start in range(0, len(prompts), batch_size):
-            batch_prompts = prompts[start : start + batch_size]
-            outputs = self.generate_batch(batch_prompts, max_new_tokens=max_new_tokens)
-            for output in outputs:
-                try:
-                    parsed = self.parse(output)
-                except Exception as exc:
-                    warnings.warn(f"Could not parse GREEN output: {exc}")
-                    parsed = ParsedGreen(score=np.nan, sig_total=0, insig_total=0, matched_findings=0, errors={})
-                rows.append(
-                    {
-                        "ru_GREEN_Qwen": parsed.score,
-                        "ru_GREEN_Qwen_sig_errors": parsed.sig_total,
-                        "ru_GREEN_Qwen_insig_errors": parsed.insig_total,
-                        "ru_GREEN_Qwen_matched_findings": parsed.matched_findings,
-                        "ru_GREEN_Qwen_errors_json": json.dumps(parsed.errors, ensure_ascii=False),
-                        "ru_GREEN_Qwen_analysis": output,
-                    }
+        keys = [hashlib.sha256(json.dumps(
+            {"id": str(row_id), "prompt": prompt, "max_new_tokens": max_new_tokens,
+             "context": cache_context}, sort_keys=True, ensure_ascii=False,
+        ).encode()).hexdigest() for row_id, prompt in zip(ids, prompts)]
+        results: Dict[int, Dict[str, Any]] = {}
+
+        def parse_row(output):
+            parsed = self.parse(output)
+            return {
+                "ru_GREEN_Qwen": parsed.score,
+                "ru_GREEN_Qwen_sig_errors": parsed.sig_total,
+                "ru_GREEN_Qwen_insig_errors": parsed.insig_total,
+                "ru_GREEN_Qwen_matched_findings": parsed.matched_findings,
+                "ru_GREEN_Qwen_errors_json": json.dumps(parsed.errors, ensure_ascii=False),
+                "ru_GREEN_Qwen_analysis": output,
+            }
+
+        # Replay valid raw answers with the current parser. The journal is separate
+        # from the worker's temporary CSV, which pipeline.py deletes on failure.
+        if response_log is not None and response_log.exists():
+            indices = {key: i for i, key in enumerate(keys)}
+            with response_log.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        warnings.warn("Ignoring damaged GREEN journal line")
+                        continue
+                    if not isinstance(entry, dict) or entry.get("key") not in indices:
+                        continue
+                    try:
+                        results[indices[entry["key"]]] = parse_row(entry["output"])
+                    except (ValueError, KeyError, TypeError):
+                        continue
+        pending = [i for i in range(len(prompts)) if i not in results]
+        print(f"GREEN: reused {len(results)} answers; pending {len(pending)}", flush=True)
+        failed = {}
+
+        def record(i, output, attempt):
+            if response_log is not None:
+                response_log.parent.mkdir(parents=True, exist_ok=True)
+                with response_log.open("a", encoding="utf-8") as stream:
+                    # Leading newline also separates a partial line after interruption.
+                    stream.write("\n" + json.dumps({"key": keys[i], "report_id": str(ids[i]),
+                                 "attempt": attempt, "output": output}, ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            try:
+                results[i] = parse_row(output)
+                failed.pop(i, None)
+            except ValueError as exc:
+                failed[i] = str(exc)
+
+        for start in range(0, len(pending), batch_size):
+            indices = pending[start:start + batch_size]
+            outputs = self.generate_batch([prompts[i] for i in indices], max_new_tokens=max_new_tokens)
+            if len(outputs) != len(indices):
+                raise ValueError("GREEN generated the wrong number of answers")
+            for i, output in zip(indices, outputs):
+                record(i, output, 0)
+            for i in indices:
+                if i not in failed:
+                    continue
+                retry_prompt = prompts[i] + (
+                    "\nПроверка формата: в каждом разделе ошибок нужны ровно шесть строк "
+                    "(а)–(е) с целым числом после двоеточия, в том числе при числе 0. "
+                    "В разделе [Совпадающие находки] сначала укажи целое число. "
+                    "Не пропускай разделы и категории."
                 )
-        return pd.DataFrame(rows)
+                output = self.generate_batch([retry_prompt], max_new_tokens=max_new_tokens)[0]
+                record(i, output, 1)
+        if failed:
+            details = {str(ids[i]): error for i, error in failed.items()}
+            raise ValueError(f"GREEN answers still malformed: {details}. "
+                             f"Raw answers: {response_log}. Valid answers are retained; rerun with --resume.")
+        return pd.DataFrame([results[i] for i in range(len(prompts))])
 
 
 def calculate_green_for_csv(
@@ -336,6 +419,13 @@ def calculate_green_for_csv(
         candidates=df[candidate_col].fillna("").astype(str).tolist(),
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
+        row_ids=df[ROW_ID_COL].astype(str).tolist(),
+        response_log=Path(input_csv).resolve().parent / "green.responses.jsonl",
+        cache_context={
+            "model": model_name, "device": device, "gpu": gpu, "batch_size": batch_size,
+            "source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "model_loading": hashlib.sha256(Path(__file__).with_name("model_loading.py").read_bytes()).hexdigest(),
+        },
     )
     out = pd.concat([df[[ROW_ID_COL]].reset_index(drop=True), scores.reset_index(drop=True)], axis=1)
     out.to_csv(output_csv, index=False)

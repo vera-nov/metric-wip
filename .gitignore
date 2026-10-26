@@ -5,3 +5,4 @@ work/
 quality_method_config.json
 quality_scores.json
 *.png
+tmp/
