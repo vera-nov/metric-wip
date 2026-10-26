@@ -56,6 +56,6 @@
     "k_inner": 5,
     "weight_step": 0.05,
     "random_state": 42,
-    "lower_transform": "reciprocal"
+    "lower_transform": "negate"
   }
 }

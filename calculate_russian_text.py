@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,25 @@ from utils import (
 PROMPT_WORD_LIMIT = 300
 MAX_MODEL_LENGTH = 8192
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+# Compatible with the GREEN journal produced by commit 14ebc87. Older valid
+# answers should survive this reliability-only change to the source file.
+LEGACY_GREEN_SOURCE_SHA256 = "a65477e7e261095a5bb7c58a560891f1bd9c94d9dcdc15447dc2f16ae636ddda"
+
+
+class GreenGenerationLimitError(ValueError):
+    """Keep all decoded outputs, including incomplete ones, for diagnosis."""
+
+    def __init__(self, outputs: List[str], complete: List[bool]):
+        super().__init__("GREEN generation hit max_new_tokens before EOS")
+        self.outputs = outputs
+        self.complete = complete
+
+
+def duration(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def safe_apply_qwen_chat_template(tokenizer: Any, messages: List[Dict[str, str]]) -> str:
@@ -174,9 +194,18 @@ class ManualGREENQwen:
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
             )
+        decoded = [self.clean_response(self.tokenizer.decode(o[input_len:], skip_special_tokens=True))
+                   for o in output]
+        complete = []
         for o in output:
-            require_complete_generation(o[input_len:], max_new_tokens, self.tokenizer.eos_token_id)
-        return [self.clean_response(self.tokenizer.decode(o[input_len:], skip_special_tokens=True)) for o in output]
+            try:
+                require_complete_generation(o[input_len:], max_new_tokens, self.tokenizer.eos_token_id)
+                complete.append(True)
+            except ValueError:
+                complete.append(False)
+        if not all(complete):
+            raise GreenGenerationLimitError(decoded, complete)
+        return decoded
 
     def _extract_section(self, text: str, title: str) -> str:
         pattern = rf"\[{re.escape(title)}\]\s*:\s*(.*?)(?=\n\s*\[[^\]]+\]\s*:|\Z)"
@@ -310,6 +339,7 @@ class ManualGREENQwen:
         row_ids: Optional[Sequence[str]] = None,
         response_log: Optional[Path] = None,
         cache_context: Optional[Dict[str, Any]] = None,
+        legacy_cache_contexts: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> pd.DataFrame:
         if len(references) != len(candidates) or batch_size < 1:
             raise ValueError("GREEN needs equal pair counts and batch_size >= 1")
@@ -317,10 +347,19 @@ class ManualGREENQwen:
         if len(ids) != len(references) or len(set(ids)) != len(ids):
             raise ValueError("GREEN row IDs must be unique and match pair counts")
         prompts = [self.make_prompt(str(r), str(c)) for r, c in zip(references, candidates)]
-        keys = [hashlib.sha256(json.dumps(
-            {"id": str(row_id), "prompt": prompt, "max_new_tokens": max_new_tokens,
-             "context": cache_context}, sort_keys=True, ensure_ascii=False,
-        ).encode()).hexdigest() for row_id, prompt in zip(ids, prompts)]
+        def make_keys(context, token_budget=None):
+            return [hashlib.sha256(json.dumps(
+                {"id": str(row_id), "prompt": prompt,
+                 **({"max_new_tokens": token_budget} if token_budget is not None else {}),
+                 "context": context}, sort_keys=True, ensure_ascii=False,
+            ).encode()).hexdigest() for row_id, prompt in zip(ids, prompts)]
+
+        # An answer that already ended with EOS is independent of its upper
+        # token budget. Version the scoring contract, not incidental code edits.
+        keys = make_keys(cache_context)
+        legacy_keys = [make_keys(context, budget)
+                       for context in (legacy_cache_contexts or [])
+                       for budget in {max_new_tokens, 512, 1024, 2048, 4096, 8192}]
         results: Dict[int, Dict[str, Any]] = {}
 
         def parse_row(output):
@@ -338,6 +377,8 @@ class ManualGREENQwen:
         # from the worker's temporary CSV, which pipeline.py deletes on failure.
         if response_log is not None and response_log.exists():
             indices = {key: i for i, key in enumerate(keys)}
+            for aliases in legacy_keys:
+                indices.update({key: i for i, key in enumerate(aliases)})
             with response_log.open(encoding="utf-8") as stream:
                 for line in stream:
                     if not line.strip():
@@ -347,7 +388,8 @@ class ManualGREENQwen:
                     except json.JSONDecodeError:
                         warnings.warn("Ignoring damaged GREEN journal line")
                         continue
-                    if not isinstance(entry, dict) or entry.get("key") not in indices:
+                    if (not isinstance(entry, dict) or entry.get("key") not in indices
+                            or entry.get("status", "complete") != "complete"):
                         continue
                     try:
                         results[indices[entry["key"]]] = parse_row(entry["output"])
@@ -357,39 +399,58 @@ class ManualGREENQwen:
         print(f"GREEN: reused {len(results)} answers; pending {len(pending)}", flush=True)
         failed = {}
 
-        def record(i, output, attempt):
+        def record(i, output, attempt, *, complete=True):
             if response_log is not None:
                 response_log.parent.mkdir(parents=True, exist_ok=True)
                 with response_log.open("a", encoding="utf-8") as stream:
                     # Leading newline also separates a partial line after interruption.
                     stream.write("\n" + json.dumps({"key": keys[i], "report_id": str(ids[i]),
-                                 "attempt": attempt, "output": output}, ensure_ascii=False) + "\n")
+                                 "attempt": attempt, "status": "complete" if complete else "truncated",
+                                 "output": output}, ensure_ascii=False) + "\n")
                     stream.flush()
                     os.fsync(stream.fileno())
+            if not complete:
+                failed[i] = f"Generation hit max_new_tokens={max_new_tokens} before EOS"
+                return
             try:
                 results[i] = parse_row(output)
                 failed.pop(i, None)
             except ValueError as exc:
                 failed[i] = str(exc)
 
+        def generate_and_record(indices, batch_prompts, attempt):
+            try:
+                outputs = self.generate_batch(batch_prompts, max_new_tokens=max_new_tokens)
+                complete = [True] * len(outputs)
+            except GreenGenerationLimitError as exc:
+                outputs, complete = exc.outputs, exc.complete
+            if len(outputs) != len(indices) or len(complete) != len(indices):
+                raise ValueError("GREEN generated the wrong number of answers")
+            for i, output, finished in zip(indices, outputs, complete):
+                record(i, output, attempt, complete=finished)
+
+        started = time.monotonic()
         for start in range(0, len(pending), batch_size):
             indices = pending[start:start + batch_size]
-            outputs = self.generate_batch([prompts[i] for i in indices], max_new_tokens=max_new_tokens)
-            if len(outputs) != len(indices):
-                raise ValueError("GREEN generated the wrong number of answers")
-            for i, output in zip(indices, outputs):
-                record(i, output, 0)
+            generate_and_record(indices, [prompts[i] for i in indices], 0)
             for i in indices:
                 if i not in failed:
                     continue
                 retry_prompt = prompts[i] + (
-                    "\nПроверка формата: в каждом разделе ошибок нужны ровно шесть строк "
+                    "\nОтветь максимально кратко, без повторений и длинных объяснений. "
+                    "В каждом разделе ошибок нужны ровно шесть строк "
                     "(а)–(е) с целым числом после двоеточия, в том числе при числе 0. "
                     "В разделе [Совпадающие находки] сначала укажи целое число. "
                     "Не пропускай разделы и категории."
                 )
-                output = self.generate_batch([retry_prompt], max_new_tokens=max_new_tokens)[0]
-                record(i, output, 1)
+                generate_and_record([i], [retry_prompt], 1)
+            done = start + len(indices)
+            elapsed = time.monotonic() - started
+            eta = elapsed / done * (len(pending) - done) if done else 0
+            print(f"GREEN: {len(results)}/{len(prompts)} valid, "
+                  f"{done}/{len(pending)} attempted this run, "
+                  f"{len(failed)} failed, elapsed {duration(elapsed)}, "
+                  f"ETA {duration(eta)}", flush=True)
         if failed:
             details = {str(ids[i]): error for i, error in failed.items()}
             raise ValueError(f"GREEN answers still malformed: {details}. "
@@ -423,9 +484,13 @@ def calculate_green_for_csv(
         response_log=Path(input_csv).resolve().parent / "green.responses.jsonl",
         cache_context={
             "model": model_name, "device": device, "gpu": gpu, "batch_size": batch_size,
-            "source": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "model_loading": hashlib.sha256(Path(__file__).with_name("model_loading.py").read_bytes()).hexdigest(),
+            "source": "green-qwen-1", "model_loading": "strict-complete-1",
         },
+        legacy_cache_contexts=[{
+            "model": model_name, "device": device, "gpu": gpu, "batch_size": batch_size,
+            "source": LEGACY_GREEN_SOURCE_SHA256,
+            "model_loading": hashlib.sha256(Path(__file__).with_name("model_loading.py").read_bytes()).hexdigest(),
+        }],
     )
     out = pd.concat([df[[ROW_ID_COL]].reset_index(drop=True), scores.reset_index(drop=True)], axis=1)
     out.to_csv(output_csv, index=False)

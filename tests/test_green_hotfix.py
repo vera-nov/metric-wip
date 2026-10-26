@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -12,7 +13,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pipeline as p
-from calculate_russian_text import ManualGREENQwen
+from calculate_russian_text import GreenGenerationLimitError, ManualGREENQwen
 from tools.revalidate_green_hotfix_cache import migrate
 
 
@@ -94,6 +95,48 @@ class GreenHotfixTests(unittest.TestCase):
             self.assertEqual(out.ru_GREEN_Qwen.iloc[0], .75)
             entries = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
             self.assertEqual([e["attempt"] for e in entries], [0, 1])
+
+    def test_truncated_answer_is_journaled_but_never_reused_as_valid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "green.responses.jsonl"
+            kwargs = dict(references=["r1", "r2", "r3"], candidates=["c1", "c2", "c3"],
+                          row_ids=["1", "2", "3"], response_log=journal,
+                          cache_context={"model": "fixture"}, max_new_tokens=4096)
+            truncated = GreenGenerationLimitError([answer()], [False])
+            with patch.object(self.green, "generate_batch",
+                              side_effect=[[answer()], truncated, truncated, [answer()]]) as gen:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output), self.assertRaisesRegex(ValueError, "'2'"):
+                    self.green.score_pairs(**kwargs)
+                self.assertEqual(gen.call_count, 4)
+            self.assertIn("2/3 valid", output.getvalue())
+            self.assertIn("ETA", output.getvalue())
+            entries = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
+            self.assertEqual([e["status"] for e in entries],
+                             ["complete", "truncated", "truncated", "complete"])
+            with patch.object(self.green, "generate_batch", return_value=[answer()]) as gen:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scores = self.green.score_pairs(**{**kwargs, "max_new_tokens": 8192})
+                self.assertEqual(gen.call_count, 1)
+                self.assertEqual(scores.ru_GREEN_Qwen.tolist(), [.75] * 3)
+
+    def test_legacy_journal_can_be_reused_after_reliability_patch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = Path(directory) / "green.responses.jsonl"
+            context = {"model": "fixture", "source": "old-source"}
+            prompt = self.green.make_prompt("ref", "cand")
+            key = hashlib.sha256(json.dumps({
+                "id": "001", "prompt": prompt, "max_new_tokens": 4096, "context": context,
+            }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            journal.write_text(json.dumps({"key": key, "output": answer()}, ensure_ascii=False) + "\n")
+            with patch.object(self.green, "generate_batch",
+                              side_effect=AssertionError("must reuse")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    scores = self.green.score_pairs(["ref"], ["cand"], row_ids=["001"],
+                                                    max_new_tokens=8192, response_log=journal,
+                                                    cache_context={"model": "fixture", "source": "new"},
+                                                    legacy_cache_contexts=[context])
+            self.assertEqual(scores.ru_GREEN_Qwen.tolist(), [.75])
 
 
 class MigrationTests(unittest.TestCase):
